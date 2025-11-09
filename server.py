@@ -45,7 +45,7 @@ SILENCE_GAP_MS = 900         # ms of silence to close an utterance
 CHECK_INTERVAL = 0.1         # worker loop sleep
 
 
-# === Mu-law (G.711) decoder (no audioop, works on Python 3.13) ===
+# === Mu-law (G.711) decoder (Python 3.11+, no audioop) ===
 
 MU_LAW_BIAS = 0x84
 MU_LAW_CLIP = 32635
@@ -76,7 +76,7 @@ def ulaw_to_linear16(data: bytes) -> bytes:
 def voice():
     """
     Twilio webhook for incoming WhatsApp voice calls.
-    Returns TwiML that starts a bidirectional Media Stream to /media-stream.
+    Starts a bidirectional Media Stream to /media-stream.
     """
     vr = VoiceResponse()
 
@@ -101,13 +101,15 @@ def media_stream(twilio_ws):
     Twilio Media Streams handler.
 
     Flow:
-      - Receive caller audio (mulaw 8k) from Twilio
-      - Segment based on silence
-      - For each utterance:
-          STT: ElevenLabs Scribe v1 (ka)
-          LLM: Gemini 2.5 Flash (Georgian)
-          TTS: ElevenLabs eleven_v3 (Jessica, ulaw_8000)
-          Stream audio back to Twilio
+      - On start: send Georgian greeting immediately.
+      - Then:
+        - Receive caller audio (mulaw 8k)
+        - Segment by silence
+        - For each utterance:
+            STT (Scribe v1, ka)
+            -> Gemini 2.5 Flash (Georgian)
+            -> TTS (Eleven v3, Jessica, ulaw_8000)
+            -> Back to Twilio
     """
     print("[Twilio] WebSocket connected")
 
@@ -119,6 +121,7 @@ def media_stream(twilio_ws):
     processing = False
     closed = False
     conversation_history = []
+    greeted = False  # track if we already played greeting
 
     def log(msg: str):
         print(f"[Call {call_sid or '?'}] {msg}")
@@ -126,16 +129,66 @@ def media_stream(twilio_ws):
     def mulaw_buffer_duration_ms(buf: bytes) -> int:
         if not buf:
             return 0
-        # 8000 samples/sec, 1 byte/sample
-        return int(len(buf) / 8000 * 1000)
+        return int(len(buf) / 8000 * 1000)  # 8kHz, 1 byte/sample
+
+    def stream_tts_text(text: str):
+        """
+        TTS (eleven_v3, Jessica, ulaw_8000) -> stream to Twilio.
+        Used for greeting and responses.
+        """
+        nonlocal stream_sid
+
+        if not eleven_client:
+            log("No ElevenLabs client; cannot TTS.")
+            return
+        if not stream_sid:
+            log("No streamSid; cannot send media.")
+            return
+
+        try:
+            audio_iter = eleven_client.text_to_speech.convert(
+                voice_id=VOICE_ID,
+                model_id=TTS_MODEL,
+                text=text,
+                output_format="ulaw_8000",
+            )
+            tts_bytes = b"".join(chunk for chunk in audio_iter)
+            if not tts_bytes:
+                log("Empty TTS for text.")
+                return
+
+            frame_size = 320  # 20ms at 8kHz
+            idx = 0
+            while idx < len(tts_bytes):
+                chunk = tts_bytes[idx: idx + frame_size]
+                idx += frame_size
+
+                payload = base64.b64encode(chunk).decode("utf-8")
+                media_msg = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload},
+                }
+                twilio_ws.send(json.dumps(media_msg))
+
+            log(f"TTS sent: {text}")
+
+        except Exception as e:
+            log(f"TTS error: {e}")
 
     def run_pipeline_on_buffer(buf: bytes):
+        """
+        1) mu-law -> PCM16 WAV
+        2) STT (ka)
+        3) Gemini (Georgian)
+        4) TTS back to Twilio
+        """
         nonlocal conversation_history
 
         if not buf:
             return
         if not eleven_client or not gemini_model:
-            log("Missing ElevenLabs or Gemini client; cannot process.")
+            log("Missing ElevenLabs or Gemini; skip pipeline.")
             return
 
         try:
@@ -149,32 +202,30 @@ def media_stream(twilio_ws):
                 wf.writeframes(pcm16)
             wav_io.seek(0)
 
-            # 2) STT (Georgian)
+            # 2) STT
             log("STT (ka) starting...")
             stt_result = eleven_client.speech_to_text.convert(
                 model_id=STT_MODEL,
                 file=wav_io,
-                language_code="ka"
+                language_code="ka",
             )
             user_text = (getattr(stt_result, "text", "") or "").strip()
             if not user_text:
-                log("STT empty, skip.")
+                log("STT empty; skip.")
                 return
 
             log(f"User 🇬🇪: {user_text}")
 
-            # 3) Gemini reply (Georgian)
+            # 3) Gemini prompt
             prompt_parts = [
                 "შენ ხარ ქართული საკონტაქტო ცენტრის ვირტუალური ოპერატორი.",
                 "საუბრობ მხოლოდ ქართულად, ბუნებრივი, პროფესიული და მეგობრული ტონით.",
-                "პასუხობ მოკლედ და გასაგებად. ნაბიჯ-ნაბიჯ უსვამ შეკითხვებს.",
+                "პასუხობ მოკლედ და გასაგებად. თითო პასუხში ერთ თემას უხსნი.",
                 "ქვემოთ არის დიალოგის ისტორია:",
             ]
-
             for turn in conversation_history[-10:]:
                 role = "მომხმარებელი" if turn["role"] == "user" else "ოპერატორი"
                 prompt_parts.append(f"{role}: {turn['content']}")
-
             prompt_parts.append(f"მომხმარებელი: {user_text}")
             prompt_parts.append("ოპერატორი (მოკლე, გასაგები პასუხი სრულად ქართულად):")
 
@@ -184,46 +235,15 @@ def media_stream(twilio_ws):
             gemini_resp = gemini_model.generate_content(full_prompt)
             ai_text = (getattr(gemini_resp, "text", "") or "").strip()
             if not ai_text:
-                ai_text = "უკაცრავად, ტექნიკური ხარვეზი მოხდა. შეგიძლიათ გაიმეოროთ კითხვა?"
+                ai_text = "უკაცრავად, ხარვეზი წარმოიქმნა. შეგიძლიათ გაიმეოროთ კითხვა?"
 
             log(f"AI 🤖: {ai_text}")
 
             conversation_history.append({"role": "user", "content": user_text})
             conversation_history.append({"role": "assistant", "content": ai_text})
 
-            # 4) TTS: ulaw_8000 for direct Twilio playback
-            log("TTS (eleven_v3, Jessica, ulaw_8000)...")
-            audio_iter = eleven_client.text_to_speech.convert(
-                voice_id=VOICE_ID,
-                model_id=TTS_MODEL,
-                text=ai_text,
-                output_format="ulaw_8000",
-            )
-            tts_bytes = b"".join(chunk for chunk in audio_iter)
-            if not tts_bytes:
-                log("Empty TTS, skip.")
-                return
-
-            # 5) Stream TTS back to Twilio
-            frame_size = 320  # 20ms @ 8kHz
-            idx = 0
-            while idx < len(tts_bytes):
-                chunk = tts_bytes[idx: idx + frame_size]
-                idx += frame_size
-
-                payload = base64.b64encode(chunk).decode("utf-8")
-                media_msg = {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload},
-                }
-                try:
-                    twilio_ws.send(json.dumps(media_msg))
-                except Exception as e:
-                    log(f"Error sending TTS chunk: {e}")
-                    break
-
-            log("TTS streamed to caller.")
+            # 4) TTS reply
+            stream_tts_text(ai_text)
 
         except Exception as e:
             log(f"Pipeline error: {e}")
@@ -273,12 +293,24 @@ def media_stream(twilio_ws):
                 call_sid = msg["start"].get("callSid")
                 print(f"[Twilio] Stream started: {stream_sid} (Call: {call_sid})")
 
+                # Send greeting once stream is ready
+                if eleven_client and not greeted:
+                    greeted = True
+                    greeting = (
+                        "გამარჯობა, თქვენ დაგიკავშირდათ ასისტენტი. "
+                        "გთხოვთ მოკლედ მითხრათ, რა საკითხზე გსურთ დახმარება?"
+                    )
+                    stream_tts_text(greeting)
+
             elif event == "media":
+                # Incoming caller audio
                 payload_b64 = msg["media"]["payload"]
                 try:
                     chunk = base64.b64decode(payload_b64)
                     audio_buffer.extend(chunk)
                     last_audio_time = time.time()
+                    # Debug:
+                    # log(f"Media chunk received: {len(chunk)} bytes")
                 except Exception as e:
                     print(f"[Twilio] Media decode error: {e}")
 
@@ -302,4 +334,5 @@ def media_stream(twilio_ws):
 
 
 if __name__ == "__main__":
+    # Local dev only; Render runs via gunicorn/Procfile
     app.run(host="0.0.0.0", port=5000, debug=True)
