@@ -10,7 +10,7 @@ from flask import Flask, request, Response
 from flask_sock import Sock
 from twilio.twiml.voice_response import VoiceResponse, Connect
 
-from elevenlabs import ElevenLabs
+from elevenlabs.client import ElevenLabs
 import google.generativeai as genai
 
 app = Flask(__name__)
