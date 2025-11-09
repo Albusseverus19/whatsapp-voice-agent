@@ -250,28 +250,45 @@ def media_stream(twilio_ws):
 
     def buffer_worker():
         """
-        Watches audio_buffer; when enough speech + silence -> run pipeline.
+        Very simple segmentation:
+        - Every ~2 seconds of audio in the buffer => treat as one utterance.
+        - Run STT -> Gemini -> TTS on that segment.
+        - When the call closes, flush whatever is left.
         """
-        nonlocal audio_buffer, last_audio_time, processing, closed
+        nonlocal audio_buffer, processing, closed
+
+        SEGMENT_MS = 2000  # 2 seconds
 
         while not closed:
             try:
-                if not processing and audio_buffer:
-                    now = time.time()
-                    gap_ms = (now - last_audio_time) * 1000.0
+                if not processing:
                     dur_ms = mulaw_buffer_duration_ms(audio_buffer)
 
-                    if dur_ms >= MIN_UTTERANCE_MS and gap_ms >= SILENCE_GAP_MS:
+                    if dur_ms >= SEGMENT_MS:
+                        # Take current buffer as one utterance
                         processing = True
                         segment = bytes(audio_buffer)
                         audio_buffer = bytearray()
+
+                        print(f"[Worker] Processing segment of {dur_ms} ms")
                         run_pipeline_on_buffer(segment)
+
                         processing = False
 
-                time.sleep(CHECK_INTERVAL)
+                time.sleep(0.2)
+
             except Exception as e:
                 print(f"[Worker] Error: {e}")
-                time.sleep(CHECK_INTERVAL)
+                time.sleep(0.5)
+
+        # Call is closing: flush remaining audio if any
+        try:
+            if audio_buffer:
+                dur_ms = mulaw_buffer_duration_ms(audio_buffer)
+                print(f"[Worker] Flushing final segment of {dur_ms} ms")
+                run_pipeline_on_buffer(bytes(audio_buffer))
+        except Exception as e:
+            print(f"[Worker] Flush error: {e}")
 
     worker_thread = threading.Thread(target=buffer_worker, daemon=True)
     worker_thread.start()
@@ -338,6 +355,7 @@ def media_stream(twilio_ws):
             twilio_ws.close()
         except Exception:
             pass
+
 
 
 if __name__ == "__main__":
