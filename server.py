@@ -1,8 +1,12 @@
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Connect
-import config
+import os
 
 app = Flask(__name__)
+
+# Get credentials from environment variables
+ELEVENLABS_AGENT_ID = os.environ.get('ELEVENLABS_AGENT_ID')
+ELEVENLABS_API_KEY = os.environ.get('ELEVENLABS_API_KEY')
 
 @app.route('/voice', methods=['POST'])
 def voice():
@@ -11,7 +15,7 @@ def voice():
     
     # Connect to ElevenLabs via WebSocket
     connect = Connect()
-    connect.stream(url=f'wss://api.elevenlabs.io/v1/convai/conversation?agent_id={config.ELEVENLABS_AGENT_ID}')
+    connect.stream(url=f'wss://api.elevenlabs.io/v1/convai/conversation?agent_id={ELEVENLABS_AGENT_ID}')
     
     response.append(connect)
     
