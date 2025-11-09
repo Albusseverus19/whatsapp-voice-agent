@@ -76,9 +76,7 @@ def ulaw_to_linear16(data: bytes) -> bytes:
 
 def elevenlabs_stt(wav_bytes: bytes, language_code: str = "ka") -> str:
     """
-    Call ElevenLabs Speech-to-Text over HTTP directly.
-    This avoids relying on `client.speech_to_text` attribute,
-    which is missing in your deployed environment.
+    ElevenLabs STT via HTTP API.
     """
     if not ELEVENLABS_API_KEY:
         print("[STT] ELEVENLABS_API_KEY not set")
@@ -149,17 +147,6 @@ def voice():
 def media_stream(twilio_ws):
     """
     Twilio Media Streams handler.
-
-    Flow:
-      - On start: async Georgian greeting
-      - Then:
-        - Receive caller audio (mu-law 8k) -> buffer
-        - Worker segments by duration
-        - For each utterance:
-            STT (ElevenLabs Scribe, ka)
-            -> Gemini 2.5 Flash (Georgian)
-            -> TTS (Eleven v3, Jessica, ulaw_8000)
-            -> back to Twilio as media events
     """
     print("[Twilio] WebSocket connected")
 
@@ -231,11 +218,11 @@ def media_stream(twilio_ws):
     def run_pipeline_on_buffer(buf: bytes):
         """
         One utterance:
-          mu-law -> PCM16 WAV -> ElevenLabs STT -> Gemini -> TTS -> Twilio
+          mu-law -> PCM16 WAV -> STT -> Gemini -> TTS -> Twilio
         """
         nonlocal conversation_history
 
-        if not buf:
+        if not buf or closed:
             return
         if not gemini_model:
             log("Gemini model missing; cannot respond.")
@@ -255,7 +242,7 @@ def media_stream(twilio_ws):
             log(f"WAV encode error: {e}")
             return
 
-        # 2) STT via ElevenLabs HTTP
+        # 2) STT
         log("STT (ka) starting...")
         user_text = elevenlabs_stt(wav_bytes, language_code="ka")
         if not user_text:
@@ -264,12 +251,12 @@ def media_stream(twilio_ws):
 
         log(f"User 🇬🇪: {user_text}")
 
-        # 3) Gemini reasoning in Georgian
+        # 3) Gemini
         try:
             prompt_parts = [
                 "შენ ხარ ქართული საკონტაქტო ცენტრის ვირტუალური ოპერატორი.",
                 "საუბრობ მხოლოდ ქართულად, ბუნებრივი, პროფესიული და მეგობრული ტონით.",
-                "პასუხობ მოკლედ და გასაგებად. თითო პასუხში ერთ მთავარ იდეას ხსნი.",
+                "პასუხობ მოკლედ და გასაგებად. თითო პასუხში ერთ მთავარ.ideას ხსნი.",
                 "ქვემოთ არის დიალოგის ისტორია:",
             ]
             for turn in conversation_history[-10:]:
@@ -291,7 +278,7 @@ def media_stream(twilio_ws):
             conversation_history.append({"role": "user", "content": user_text})
             conversation_history.append({"role": "assistant", "content": ai_text})
 
-            # 4) TTS back to caller
+            # 4) Answer via TTS
             stream_tts_text(ai_text)
 
         except Exception as e:
@@ -299,10 +286,9 @@ def media_stream(twilio_ws):
 
     def buffer_worker():
         """
-        Simple segmentation worker:
-        - Every ~2s of audio currently in buffer => treat as one utterance.
-        - Run STT -> Gemini -> TTS on that segment.
-        - On close, flush remaining.
+        Simple segmentation:
+        - Every ~2s of buffered audio => one utterance.
+        - On close, flush leftover.
         """
         nonlocal audio_buffer, processing, closed
 
@@ -340,7 +326,7 @@ def media_stream(twilio_ws):
     worker_thread = threading.Thread(target=buffer_worker, daemon=True)
     worker_thread.start()
 
-    # === Main Twilio WS loop ===
+    # === Main WS loop ===
     try:
         while True:
             raw = twilio_ws.receive()
@@ -360,7 +346,6 @@ def media_stream(twilio_ws):
                 call_sid = msg["start"].get("callSid")
                 print(f"[Twilio] Stream started: {stream_sid} (Call: {call_sid})")
 
-                # Greeting (async)
                 if eleven_client and not greeted:
                     greeted = True
                     greeting = (
@@ -374,7 +359,6 @@ def media_stream(twilio_ws):
                     ).start()
 
             elif event == "media":
-                # Incoming caller audio
                 payload_b64 = msg["media"]["payload"]
                 try:
                     chunk = base64.b64decode(payload_b64)
@@ -403,5 +387,5 @@ def media_stream(twilio_ws):
 
 
 if __name__ == "__main__":
-    # Local dev only; Render will run via gunicorn
+    # Local dev only; in production use gunicorn with websocket worker + high timeout.
     app.run(host="0.0.0.0", port=5000, debug=True)

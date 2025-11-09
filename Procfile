@@ -1,1 +1,1 @@
-web: gunicorn server:app -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --bind 0.0.0.0:10000
+web: gunicorn server:app --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker --workers 1 --timeout 600 --log-level info
