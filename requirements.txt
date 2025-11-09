@@ -1,3 +1,5 @@
 flask==3.0.0
 twilio==9.0.0
 gunicorn==21.2.0
+flask-sock==0.7.0
+websockets==12.0
