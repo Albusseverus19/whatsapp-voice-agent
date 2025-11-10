@@ -200,6 +200,7 @@ async def twilio_voice_answer(request: Request):
     call_sid = form.get("CallSid", "unknown")
 
     logger.info(f"Incoming call: {call_sid}")
+    logger.info(f"Using MEDIA_STREAM_WS_URL={MEDIA_STREAM_WS_URL}")
 
     vr = VoiceResponse()
     connect = vr.connect()
@@ -209,7 +210,11 @@ async def twilio_voice_answer(request: Request):
         track="both_tracks"
     )
 
-    return str(vr)
+    twiml_str = str(vr)
+    logger.info(f"TwiML response for {call_sid}: {twiml_str}")
+
+    return twiml_str
+
 
 
 # ----------- 2. Twilio Media Stream WebSocket -----------
