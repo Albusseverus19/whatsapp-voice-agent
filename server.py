@@ -304,23 +304,30 @@ def voice():
     """
     Twilio Voice webhook.
 
-    Use <Connect><Stream> for bidirectional Media Streams:
-    - Keeps the call open
-    - Twilio sends continuous media events
-    - We can send audio back on the same WebSocket
+    - Play an audible greeting with <Say> (Twilio TTS) so it's never silent.
+    - Then start <Connect><Stream> to our /media WebSocket.
     """
     public_ws_url = os.environ.get(
         "PUBLIC_WS_URL",
         f"wss://{request.host}/media"
     )
 
+    log.info(f"[VOICE] Using PUBLIC_WS_URL={public_ws_url}")
+
     vr = VoiceResponse()
 
-    # Bidirectional stream: call stays connected as long as WS is open
+    # 1) Audible greeting via Twilio itself (always works)
+    vr.say(
+        "გამარჯობა, თქვენ დაუკავშირდით ვირტუალურ ასისტენტს. "
+        "გთხოვთ დარჩეთ ხაზზე და ილაპარაკეთ ბიპის შემდეგ.",
+        language="ka-GE",
+        voice="woman"
+    )
+
+    # 2) Start bidirectional media stream
     connect = vr.connect()
     connect.stream(url=public_ws_url)
 
-    # No <Say> here: our bot will speak via ElevenLabs over the stream.
     return Response(str(vr), mimetype="text/xml")
 
 
