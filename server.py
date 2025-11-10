@@ -235,28 +235,31 @@ def tts_elevenlabs(text: str) -> bytes | None:
         return None
 
     try:
-        # Example ElevenLabs v1 text-to-speech call.
-        # Adjust voice_id / format to your setup.
-        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "")
+        # default voice: Jessica (cgSgspJ2msm6clMCkdW9)
+        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
         if not voice_id:
-            log.error("ELEVENLABS_VOICE_ID not set")
+            log.error("ELEVENLABS_VOICE_ID missing even after default fallback")
             return None
+
 
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         headers = {
             "xi-api-key": ELEVENLABS_API_KEY,
             "Content-Type": "application/json",
         }
-        # Request μ-law 8kHz mono so we can forward directly to Twilio
+        # Use the newer ElevenLabs multilingual model
+        tts_model = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_v3")
+
         payload = {
             "text": text,
             "voice_settings": {
                 "stability": 0.5,
                 "similarity_boost": 0.7,
             },
-            "model_id": "eleven_monolingual_v1",
+            "model_id": tts_model,
             "output_format": "ulaw_8000"
         }
+
 
         r = requests.post(url, headers=headers, json=payload, timeout=15)
         r.raise_for_status()
