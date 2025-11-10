@@ -205,10 +205,9 @@ async def twilio_voice_answer(request: Request):
     vr = VoiceResponse()
     connect = vr.connect()
     connect.stream(
-        url=MEDIA_STREAM_WS_URL,
-        bidirectional=True,
-        track="both_tracks"
+        url=MEDIA_STREAM_WS_URL
     )
+
 
     twiml_str = str(vr)
     logger.info(f"TwiML response for {call_sid}: {twiml_str}")
