@@ -414,14 +414,7 @@ def media(ws):
                 log.info(f"[Twilio] Stream started: {stream_sid}")
                 ctx = CallContext(stream_sid, ws)
                 calls[stream_sid] = ctx
-
-                # Optional: ElevenLabs greeting over stream
-                greeting = (
-                    "გამარჯობა, მე გისმენ. გთხოვთ მითხრათ, რით შემიძლია დაგეხმაროთ."
-                )
-                audio_bytes = tts_elevenlabs(greeting, stream_sid)
-                if audio_bytes:
-                    send_audio_to_twilio(ws, audio_bytes, stream_sid)
+                log.info(f"[Call {stream_sid}] Ready to receive audio")
 
             elif event == "media" and ctx:
                 media_obj = msg.get("media", {})
