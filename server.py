@@ -299,36 +299,49 @@ def tts_elevenlabs(text: str) -> bytes | None:
 def send_audio_to_twilio(ws, audio_bytes: bytes, stream_sid: str):
     """
     Send ulaw_8000 audio back over the same WebSocket as Twilio 'media' events.
-    Chunked into ~20ms frames (160 bytes) as recommended.
+    Chunk into 20ms frames (160 bytes) for bidirectional media streams.
     """
     if not audio_bytes:
+        log.warning(f"[Call {stream_sid}] No audio bytes to send")
         return
 
-    frame_size = 160  # 20ms at 8000 bytes/sec
+    # 8000 samples/sec * 1 byte (8-bit μ-law) = 8000 bytes/sec
+    # 20ms frame = 0.02 * 8000 = 160 bytes
+    frame_size = 160
+    total_len = len(audio_bytes)
     pos = 0
     sent_frames = 0
 
     try:
-        while pos < len(audio_bytes):
+        while pos < total_len:
             chunk = audio_bytes[pos:pos + frame_size]
             pos += frame_size
             if not chunk:
                 break
 
+            # If last chunk is shorter, pad with silence (0xFF in μ-law)
+            if len(chunk) < frame_size:
+                chunk = chunk + b"\xff" * (frame_size - len(chunk))
+
             payload = base64.b64encode(chunk).decode("ascii")
+
             msg = {
                 "event": "media",
                 "streamSid": stream_sid,
                 "media": {
-                    "payload": payload
+                    # Twilio Bidirectional Media: payload is μ-law 8kHz base64
+                    "payload": payload,
+                    # Mark as outbound so it's clearly from us to caller
+                    "track": "outbound"
                 }
             }
+
             ws.send(json.dumps(msg))
             sent_frames += 1
 
         log.info(
-            f"[Call {stream_sid}] Sent {sent_frames} TTS frames to Twilio "
-            f"(total {len(audio_bytes)} bytes)"
+            f"[Call {stream_sid}] Sent {sent_frames} outbound TTS frames "
+            f"(total {total_len} bytes)"
         )
 
     except Exception as e:
