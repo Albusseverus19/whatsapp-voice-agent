@@ -352,10 +352,11 @@ def media(ws):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                log.warning(f"[WS] Non-JSON frame: {repr(raw)[:80]}")
+                log.warning(f"[WS] Non-JSON frame: {repr(raw)[:120]}")
                 continue
 
             event = msg.get("event")
+            log.info(f"[WS] Incoming event: {event} | msg: {str(msg)[:200]}")
 
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
@@ -373,6 +374,10 @@ def media(ws):
             elif event == "stop":
                 log.info(f"[Twilio] Stream stopped event for {stream_sid}")
                 break
+
+            # (Optional) just log anything unexpected
+            else:
+                log.info(f"[WS] Unhandled event type: {event}")
 
     except Exception as e:
         log.error(f"[WS] Error: {e}")
