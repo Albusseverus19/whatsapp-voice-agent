@@ -1,446 +1,390 @@
 import os
 import json
-import time
 import base64
+import queue
 import threading
-import io
-import wave
+import time
+import logging
 
 from flask import Flask, request, Response
 from flask_sock import Sock
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.twiml.voice_response import VoiceResponse, Start, Stream
 
-from elevenlabs.client import ElevenLabs
-import google.generativeai as genai
+# ---------- CONFIG ----------
+
+# IMPORTANT: set these in Render dashboard -> Environment
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+
+# Use current Gemini API (python-genai / google-genai style client)
+# Docs: https://ai.google.dev/gemini-api/docs
+from google import genai
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set")
+
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Model for STT + reasoning.
+# 2.5 Flash supports audio + is cheap/fast; we instruct it to ONLY TRANSCRIBE for STT.
+GEMINI_STT_MODEL = "gemini-2.5-flash"
+GEMINI_CHAT_MODEL = "gemini-2.5-flash"
+
+# Audio from Twilio: 8kHz, mono, μ-law
+TWILIO_AUDIO_MIME = "audio/mulaw;rate=8000"
+
+SEGMENT_MS = 2000          # ~2s segments for STT
+MAX_SEGMENTS_PER_CALL = 40 # safety: prevents unbounded growth
+WORKER_IDLE_TIMEOUT = 15   # stop worker if no segments for N seconds
+
+# ---------- LOGGING ----------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("voice-agent")
+
+# ---------- FLASK / SOCK SETUP ----------
 
 app = Flask(__name__)
 sock = Sock(app)
 
-# === Config from environment ===
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Per-call context
+calls = {}  # { stream_sid: CallContext }
 
-if not ELEVENLABS_API_KEY:
-    print("[Config] ELEVENLABS_API_KEY is not set!")
-if not GEMINI_API_KEY:
-    print("[Config] GEMINI_API_KEY is not set!")
 
-# === Initialize external clients ===
-eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
+class CallContext:
+    def __init__(self, stream_sid, ws):
+        self.stream_sid = stream_sid
+        self.ws = ws
+        self.buffer = bytearray()
+        self.segment_queue = queue.Queue()
+        self.active = True
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True
+        )
+        self.last_activity = time.time()
+        self.segment_count = 0
+        self.worker_thread.start()
 
-# We'll use:
-# - gemini-1.5-pro-latest for STT (audio -> text)
-# - gemini-2.5-flash for dialogue (text -> answer)
-gemini_stt_model = None
-gemini_text_model = None
+    # ------------ Worker ------------
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    def _worker_loop(self):
+        """
+        Consume audio segments, run STT + reply, send TTS back.
+        Dies automatically on timeout or stop.
+        """
+        log.info(f"[Call {self.stream_sid}] Worker started")
+        while self.active:
+            try:
+                segment = self.segment_queue.get(timeout=1)
+            except queue.Empty:
+                # idle timeout
+                if (time.time() - self.last_activity) > WORKER_IDLE_TIMEOUT:
+                    log.info(f"[Call {self.stream_sid}] Worker idle timeout, stopping")
+                    break
+                continue
+
+            if segment is None:
+                log.info(f"[Call {self.stream_sid}] Worker got stop signal")
+                break
+
+            self.last_activity = time.time()
+            text = safe_stt_georgian(segment, self.stream_sid)
+
+            if not text:
+                continue
+
+            log.info(f"[Call {self.stream_sid}] STT text: {text}")
+
+            reply = generate_reply(text, self.stream_sid)
+            log.info(f"[Call {self.stream_sid}] Reply: {reply}")
+
+            audio_bytes = tts_elevenlabs(reply)
+            if audio_bytes:
+                send_audio_to_twilio(self.ws, audio_bytes, self.stream_sid)
+
+        self.active = False
+        log.info(f"[Call {self.stream_sid}] Worker stopped")
+
+    # ------------ Media handling ------------
+
+    def add_media(self, chunk_bytes: bytes):
+        """Accumulate media, cut into fixed-size segments for STT."""
+        if not self.active:
+            return
+
+        self.buffer.extend(chunk_bytes)
+
+        # 8000 bytes ~= 1 second for 8kHz 8bit μ-law
+        bytes_per_ms = 8  # approx, safe for our purpose
+        target_len = SEGMENT_MS * bytes_per_ms
+
+        while len(self.buffer) >= target_len:
+            if self.segment_count >= MAX_SEGMENTS_PER_CALL:
+                log.warning(f"[Call {self.stream_sid}] Reached MAX_SEGMENTS_PER_CALL, dropping further audio")
+                self.buffer.clear()
+                return
+
+            segment = self.buffer[:target_len]
+            del self.buffer[:target_len]
+
+            self.segment_queue.put(segment)
+            self.segment_count += 1
+            log.info(f"[Call {self.stream_sid}] Queued segment #{self.segment_count} ({SEGMENT_MS} ms)")
+
+    def stop(self):
+        self.active = False
+        # Signal worker to exit
+        try:
+            self.segment_queue.put_nowait(None)
+        except Exception:
+            pass
+
+
+# ---------- GEMINI STT ----------
+
+def safe_stt_georgian(audio_bytes: bytes, stream_sid: str) -> str | None:
+    """
+    Send one short audio segment to Gemini for transcription.
+    We FORCE it to only transcribe Georgian and return plain text.
+    """
     try:
-        gemini_stt_model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        resp = genai_client.models.generate_content(
+            model=GEMINI_STT_MODEL,
+            contents=[{
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            "გთხოვ ზუსტად და მოკლედ გადააქციე ეს აუდიო ქართულ ტექსტად. "
+                            "არ დაამატო არანაირი ახსნა, თარგმანი ან დამატებითი ტექსტი. "
+                            "მომეცი მხოლოდ ის, რაც დამრეკვლმა თქვა ქართულად."
+                        )
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": TWILIO_AUDIO_MIME,
+                            "data": b64
+                        }
+                    },
+                ],
+            }],
+        )
+
+        text = (resp.text or "").strip()
+        if not text:
+            return None
+
+        # Basic garbage filter (e.g., if model hallucinates non-Georgian)
+        if any(ord(c) > 0x04FF for c in text):  # outside Georgian block & basic ASCII
+            log.warning(f"[Call {stream_sid}] STT suspicious (non-ka chars), dropping: {text}")
+            return None
+
+        return text
+
     except Exception as e:
-        print("[Config] Failed to init gemini-1.5-pro-latest for STT:", e)
+        log.error(f"[Call {stream_sid}] STT error: {e}")
+        return None
+
+
+# ---------- GEMINI CHAT ----------
+
+def generate_reply(user_text: str, stream_sid: str) -> str:
+    """
+    Use Gemini to generate a short Georgian reply.
+    You can enrich this with tools / context later.
+    """
+    try:
+        resp = genai_client.models.generate_content(
+            model=GEMINI_CHAT_MODEL,
+            contents=[{
+                "role": "user",
+                "parts": [{
+                    "text": (
+                        "შენ ხარ ქართული ენის ვირტუალური ასისტენტი სატელეფონო ზარებისთვის. "
+                        "უპასუხე მოკლედ, გასაგებად და თავაზიანად.\n\n"
+                        f"მომხმარებლის ტექსტი: {user_text}"
+                    )
+                }]
+            }],
+        )
+        text = (resp.text or "").strip()
+        if not text:
+            return "ვწუხვარ, ვერ გავიგე ზუსტად. გთხოვთ განმეორებით მითხრათ, რა გსურთ."
+        return text
+
+    except Exception as e:
+        log.error(f"[Call {stream_sid}] Reply generation error: {e}")
+        return "ვწუხვარ, შევეჯახე ტექნიკურ შეცდომას. გთხოვთ სცადოთ თავიდან."
+
+
+# ---------- ELEVENLABS TTS ----------
+
+import requests
+
+def tts_elevenlabs(text: str) -> bytes | None:
+    """
+    Convert reply text to 8kHz μ-law mono audio for Twilio.
+    Make sure your ElevenLabs voice is configured; adjust URL/params if needed.
+    """
+    if not ELEVENLABS_API_KEY:
+        log.error("ELEVENLABS_API_KEY not set")
+        return None
 
     try:
-        gemini_text_model = genai.GenerativeModel("gemini-2.5-flash")
+        # Example ElevenLabs v1 text-to-speech call.
+        # Adjust voice_id / format to your setup.
+        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "")
+        if not voice_id:
+            log.error("ELEVENLABS_VOICE_ID not set")
+            return None
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+        }
+        # Request μ-law 8kHz mono so we can forward directly to Twilio
+        payload = {
+            "text": text,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.7,
+            },
+            "model_id": "eleven_monolingual_v1",
+            "output_format": "ulaw_8000"
+        }
+
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        return r.content
+
     except Exception as e:
-        print("[Config] Failed to init gemini-2.5-flash for text:", e)
-else:
-    print("[Config] GEMINI_API_KEY missing; Gemini features disabled.")
+        log.error(f"TTS error: {e}")
+        return None
 
-# Voice & model settings
-VOICE_ID = "cgSgspJ2msm6clMCkdW9"  # Jessica
-TTS_MODEL = "eleven_v3"
 
-# Silence / segmentation tuning
-SEGMENT_MS = 2000            # length of buffered audio before processing
-CHECK_INTERVAL = 0.2         # worker loop sleep
+# ---------- SEND AUDIO BACK TO TWILIO ----------
 
-# === μ-law decoder ===
+def send_audio_to_twilio(ws, audio_bytes: bytes, stream_sid: str):
+    """
+    Send audio back over the same WebSocket as a Twilio 'media' message.
+    Twilio will play it to the caller.
+    """
+    try:
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        msg = {
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {
+                "payload": b64
+            }
+        }
+        ws.send(json.dumps(msg))
+        log.info(f"[Call {stream_sid}] Sent TTS audio to Twilio ({len(audio_bytes)} bytes)")
+    except Exception as e:
+        log.error(f"[Call {stream_sid}] Error sending audio to Twilio: {e}")
 
-MU_LAW_BIAS = 0x84
-MU_LAW_CLIP = 32635
 
-def _ulaw_byte_to_linear(sample: int) -> int:
-    sample = ~sample & 0xFF
-    sign = sample & 0x80
-    exponent = (sample >> 4) & 0x07
-    mantissa = sample & 0x0F
-    magnitude = ((mantissa << 4) + 0x08) << exponent
-    magnitude = magnitude - MU_LAW_BIAS
-    if magnitude > MU_LAW_CLIP:
-        magnitude = MU_LAW_CLIP
-    if sign != 0:
-        magnitude = -magnitude
-    return magnitude
+# ---------- TWILIO WEBHOOKS ----------
 
-def ulaw_to_linear16(data: bytes) -> bytes:
-    out = bytearray()
-    for b in data:
-        s = _ulaw_byte_to_linear(b)
-        out.append(s & 0xFF)
-        out.append((s >> 8) & 0xFF)
-    return bytes(out)
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
 
 
 @app.route("/voice", methods=["POST"])
 def voice():
     """
-    Twilio webhook for incoming WhatsApp voice calls.
-    Starts a bidirectional Media Stream to /media-stream.
+    Twilio Voice webhook.
+    Returns TwiML that starts media stream to our /media WebSocket
+    and plays initial greeting via Twilio (fast + reliable).
     """
+    public_ws_url = os.environ.get(
+        "PUBLIC_WS_URL",
+        # fallback: guess from Render hostname (set properly in env for safety)
+        f"wss://{request.host}/media"
+    )
+
     vr = VoiceResponse()
 
-    base = request.host_url.rstrip("/")
-    if base.startswith("http://"):
-        ws_base = "wss://" + base[len("http://"):]
-    elif base.startswith("https://"):
-        ws_base = "wss://" + base[len("https://"):]
-    else:
-        ws_base = "wss://" + base
+    start = Start()
+    start.stream(url=public_ws_url)
+    vr.append(start)
 
-    connect = Connect()
-    connect.stream(url=f"{ws_base}/media-stream")
-    vr.append(connect)
+    # Initial greeting is done by Twilio TTS itself (cheap and instant)
+    vr.say(
+        "გამარჯობა, თქვენ დაგიკავშირდათ ვირტუალური ასისტენტი. "
+        "გთხოვთ მოკლედ მითხრათ, რა საკითხზე გსურთ დახმარება?",
+        language="ka-GE",
+        voice="woman"
+    )
 
     return Response(str(vr), mimetype="text/xml")
 
 
-@sock.route("/media-stream")
-def media_stream(twilio_ws):
-    """
-    Twilio Media Streams handler.
+# ---------- MEDIA WEBSOCKET ----------
 
-    Flow:
-      - On start: async Georgian greeting (ElevenLabs TTS)
-      - Loop:
-        * Collect caller μ-law 8k audio into buffer
-        * Worker thread chunks ~2s segments
-        * For each segment:
-            - μ-law -> PCM16 WAV
-            - Gemini STT (1.5 Pro) -> Georgian text
-            - Gemini 2.5 Flash -> Georgian reply
-            - ElevenLabs TTS -> send back via media events
+@sock.route("/media")
+def media(ws):
     """
-    print("[Twilio] WebSocket connected")
-
+    Handles Twilio Media Streams over WebSocket.
+    """
     stream_sid = None
-    call_sid = None
+    ctx: CallContext | None = None
 
-    audio_buffer = bytearray()
-    processing = False
-    closed = False
-    greeted = False
-    conversation_history = []
-
-    def log(msg: str):
-        print(f"[Call {call_sid or '?'}] {msg}")
-
-    def mulaw_buffer_duration_ms(buf: bytes) -> int:
-        if not buf:
-            return 0
-        # 8kHz, 1 byte/sample (μ-law)
-        return int(len(buf) / 8000 * 1000)
-
-    def stream_tts_text(text: str):
-        """
-        ElevenLabs TTS (ulaw_8000) -> Twilio media events.
-        """
-        nonlocal stream_sid
-
-        if not eleven_client:
-            log("No ElevenLabs client; cannot TTS.")
-            return
-        if not stream_sid:
-            log("No streamSid; cannot send media.")
-            return
-
-        try:
-            audio_iter = eleven_client.text_to_speech.convert(
-                voice_id=VOICE_ID,
-                model_id=TTS_MODEL,
-                text=text,
-                output_format="ulaw_8000",
-            )
-            tts_bytes = b"".join(chunk for chunk in audio_iter)
-            if not tts_bytes:
-                log("Empty TTS output.")
-                return
-
-            frame_size = 320  # 20ms @ 8kHz
-            idx = 0
-            while idx < len(tts_bytes):
-                chunk = tts_bytes[idx: idx + frame_size]
-                idx += frame_size
-
-                payload = base64.b64encode(chunk).decode("utf-8")
-                media_msg = {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload},
-                }
-                try:
-                    twilio_ws.send(json.dumps(media_msg))
-                except Exception as e:
-                    log(f"TTS send error: {e}")
-                    break
-
-            log(f"TTS sent: {text}")
-        except Exception as e:
-            log(f"TTS error: {e}")
-
-    def gemini_stt_from_wav(wav_bytes: bytes) -> str:
-        """
-        Use Gemini 1.5 Pro as STT:
-        - Input: WAV bytes (8kHz, mono)
-        - Output: recognized Georgian text (or "")
-        """
-        if not gemini_stt_model:
-            log("Gemini STT model not initialized.")
-            return ""
-
-        try:
-            b64_audio = base64.b64encode(wav_bytes).decode("utf-8")
-
-            prompt_text = (
-                "ქვემოთ მოცემულია მომხმარებლის ხმა. "
-                "გთხოვთ ზუსტად გადაწეროთ, რას ამბობს მომხმარებელი ქართულ ენაზე. "
-                "არ დაამატოთ განმარტებები, მხოლოდ ტექსტი."
-            )
-
-            # We pass a single user Content with a text prompt + inline_data audio.
-            response = gemini_stt_model.generate_content(
-                [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"text": prompt_text},
-                            {
-                                "inline_data": {
-                                    "mime_type": "audio/wav",
-                                    "data": b64_audio,
-                                }
-                            },
-                        ],
-                    }
-                ]
-            )
-
-            text = (getattr(response, "text", "") or "").strip()
-            if not text and hasattr(response, "candidates"):
-                # Fallback: try to read from candidates if needed
-                for c in response.candidates:
-                    if c.content and c.content.parts:
-                        for p in c.content.parts:
-                            if getattr(p, "text", "").strip():
-                                text = p.text.strip()
-                                break
-                    if text:
-                        break
-
-            if text:
-                log(f"[STT] -> {text}")
-            else:
-                log("[STT] Empty transcription from Gemini.")
-
-            return text or ""
-
-        except Exception as e:
-            log(f"Gemini STT error: {e}")
-            return ""
-
-    def gemini_reply(history, user_text: str) -> str:
-        """
-        Use Gemini 2.5 Flash to answer in Georgian.
-        """
-        if not gemini_text_model:
-            log("Gemini text model not initialized.")
-            return "უკაცრავად, ტექნიკური პრობლემა გვაქვს. სცადეთ მოგვიანებით."
-
-        try:
-            prompt_parts = [
-                "შენ ხარ ქართული საკონტაქტო ცენტრის ვირტუალური ოპერატორი.",
-                "საუბრობ მხოლოდ ქართულად, ბუნებრივი, პროფესიული და მეგობრული ტონით.",
-                "პასუხობ მოკლედ და გასაგებად; თითო პასუხში ერთ მთავარ აზრს ხსნი.",
-                "ქვემოთ არის დიალოგის ისტორია:",
-            ]
-
-            for turn in history[-10:]:
-                role = "მომხმარებელი" if turn["role"] == "user" else "ოპერატორი"
-                prompt_parts.append(f"{role}: {turn['content']}")
-
-            prompt_parts.append(f"მომხმარებელი: {user_text}")
-            prompt_parts.append("ოპერატორი (მოკლე, გასაგები პასუხი ქართულად):")
-
-            full_prompt = "\n".join(prompt_parts)
-
-            log("Gemini thinking...")
-            resp = gemini_text_model.generate_content(full_prompt)
-            ai_text = (getattr(resp, "text", "") or "").strip()
-
-            if not ai_text and hasattr(resp, "candidates"):
-                for c in resp.candidates:
-                    if c.content and c.content.parts:
-                        for p in c.content.parts:
-                            if getattr(p, "text", "").strip():
-                                ai_text = p.text.strip()
-                                break
-                    if ai_text:
-                        break
-
-            if not ai_text:
-                ai_text = "უკაცრავად, ხარვეზი წარმოიქმნა. შეგიძლიათ გაიმეოროთ კითხვა?"
-
-            log(f"AI 🤖: {ai_text}")
-            return ai_text
-
-        except Exception as e:
-            log(f"Gemini reply error: {e}")
-            return "უკაცრავად, ტექნიკური ხარვეზია. სცადეთ კიდევ ერთხელ."
-
-    def run_pipeline_on_buffer(buf: bytes):
-        """
-        One utterance:
-          μ-law -> PCM16 WAV -> Gemini STT -> Gemini reply -> ElevenLabs TTS
-        """
-        nonlocal conversation_history
-
-        if not buf:
-            return
-        if not eleven_client:
-            log("No ElevenLabs client; cannot complete pipeline.")
-            return
-
-        # 1) μ-law -> PCM16 WAV (8kHz, mono)
-        try:
-            pcm16 = ulaw_to_linear16(buf)
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(8000)
-                wf.writeframes(pcm16)
-            wav_bytes = wav_io.getvalue()
-        except Exception as e:
-            log(f"WAV build error: {e}")
-            return
-
-        # 2) Gemini STT
-        log("STT (ka) starting...")
-        user_text = gemini_stt_from_wav(wav_bytes)
-        if not user_text:
-            log("STT empty; skip this chunk.")
-            return
-
-        conversation_history.append({"role": "user", "content": user_text})
-
-        # 3) Gemini answer
-        ai_text = gemini_reply(conversation_history, user_text)
-        conversation_history.append({"role": "assistant", "content": ai_text})
-
-        # 4) TTS back to caller
-        stream_tts_text(ai_text)
-
-    def buffer_worker():
-        """
-        Simple segmentation:
-        - Every ~2s of audio in buffer => process as one utterance.
-        - On close, flush remaining.
-        """
-        nonlocal audio_buffer, processing, closed
-
-        while not closed:
-            try:
-                if not processing:
-                    dur_ms = mulaw_buffer_duration_ms(audio_buffer)
-                    if dur_ms >= SEGMENT_MS:
-                        processing = True
-                        segment = bytes(audio_buffer)
-                        audio_buffer = bytearray()
-                        print(f"[Worker] Processing segment of {dur_ms} ms")
-                        run_pipeline_on_buffer(segment)
-                        processing = False
-
-                time.sleep(CHECK_INTERVAL)
-
-            except Exception as e:
-                print(f"[Worker] Error: {e}")
-                time.sleep(0.5)
-
-        # On close: flush final audio
-        try:
-            if audio_buffer:
-                dur_ms = mulaw_buffer_duration_ms(audio_buffer)
-                print(f"[Worker] Flushing final segment of {dur_ms} ms")
-                run_pipeline_on_buffer(bytes(audio_buffer))
-        except Exception as e:
-            print(f"[Worker] Flush error: {e}")
-
-    worker_thread = threading.Thread(target=buffer_worker, daemon=True)
-    worker_thread.start()
-
-    # === Main WS loop ===
     try:
-        while True:
-            raw = twilio_ws.receive()
-            if raw is None:
-                break
+        for raw in ws:
+            if not raw:
+                continue
 
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                print("[Twilio] Invalid JSON")
+                log.warning(f"[WS] Non-JSON frame: {raw[:60]!r}")
                 continue
 
             event = msg.get("event")
 
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
-                call_sid = msg["start"].get("callSid")
-                print(f"[Twilio] Stream started: {stream_sid} (Call: {call_sid})")
+                log.info(f"[Twilio] Stream started: {stream_sid}")
+                ctx = CallContext(stream_sid, ws)
+                calls[stream_sid] = ctx
 
-                # Greeting (non-blocking)
-                if eleven_client and not greeted:
-                    greeted = True
-                    greeting = (
-                        "გამარჯობა, თქვენ დაგიკავშირდათ ვირტუალური ასისტენტი. "
-                        "გთხოვთ მოკლედ მითხრათ, რა საკითხზე გსურთ დახმარება?"
-                    )
-                    threading.Thread(
-                        target=stream_tts_text,
-                        args=(greeting,),
-                        daemon=True,
-                    ).start()
-
-            elif event == "media":
-                # Caller audio (base64 μ-law)
-                payload_b64 = msg["media"]["payload"]
-                try:
-                    chunk = base64.b64decode(payload_b64)
-                    audio_buffer.extend(chunk)
-                    log(f"Media chunk received: {len(chunk)} bytes")
-                except Exception as e:
-                    print(f"[Twilio] Media decode error: {e}")
+            elif event == "media" and ctx:
+                media = msg.get("media", {})
+                payload = media.get("payload")
+                if payload:
+                    chunk = base64.b64decode(payload)
+                    ctx.add_media(chunk)
 
             elif event == "stop":
-                print("[Twilio] Stream stopped")
-                break
-
-            elif event == "clear":
-                audio_buffer = bytearray()
+                if ctx:
+                    log.info(f"[Twilio] Stream stopped: {stream_sid}")
+                    break
 
     except Exception as e:
-        print(f"[WS] Error: {e}")
+        log.error(f"[WS] Error: {e}")
 
     finally:
-        closed = True
-        print("[WS] Closing sockets")
+        if ctx:
+            ctx.stop()
+            calls.pop(ctx.stream_sid, None)
         try:
-            twilio_ws.close()
+            ws.close()
         except Exception:
             pass
+        log.info("[WS] Closing sockets")
 
 
+# ---------- GUNICORN ENTRY ----------
+
+# Gunicorn will look for 'app'
 if __name__ == "__main__":
-    # Local dev only; Render uses Procfile with gunicorn
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # For local testing only
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
