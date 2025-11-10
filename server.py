@@ -39,8 +39,8 @@ TWILIO_SAMPLE_RATE = 8000
 TWILIO_AUDIO_MIME = "audio/mulaw;rate=8000"
 
 # Segmentation / worker
-SEGMENT_MS = 800             # 0.8s chunks → more responsive
-MAX_SEGMENTS_PER_CALL = 40
+SEGMENT_MS = 3000             
+MAX_SEGMENTS_PER_CALL = 20
 WORKER_IDLE_TIMEOUT = 15
 
 # ================== LOGGING ==================
