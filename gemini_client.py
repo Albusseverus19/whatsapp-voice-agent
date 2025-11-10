@@ -11,7 +11,7 @@ logger = logging.getLogger("gemini-live")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash-native-audio-preview-09-2025"
+    "gemini-2.5-flash-native-audio-preview-09-2025",
 )
 
 if not GEMINI_API_KEY:
@@ -21,6 +21,7 @@ if not GEMINI_API_KEY:
 class GeminiLiveSession:
     """
     One Gemini Live session per call.
+
     - send_audio_chunk(pcm16) is called with user audio.
     - When Gemini completes a turn, it calls async on_final_text(text).
     """
@@ -30,9 +31,12 @@ class GeminiLiveSession:
         self.on_final_text = on_final_text
 
         self._client: Optional[genai.Client] = None
-        self._session = None
+        self._session_cm = None  # async context manager
+        self._session = None     # live session object
         self._listen_task: Optional[asyncio.Task] = None
+
         self._current_text_parts = []
+        self._closed = False
 
     async def start(self):
         if not GEMINI_API_KEY:
@@ -51,15 +55,20 @@ class GeminiLiveSession:
 
         logger.info(f"[{self.call_sid}] Starting Gemini Live session with model={GEMINI_MODEL}")
 
-        self._session = await self._client.aio.live.connect(
+        # live.connect() returns an async context manager -> must use __aenter__()
+        self._session_cm = self._client.aio.live.connect(
             model=GEMINI_MODEL,
             config=config,
         )
+        self._session = await self._session_cm.__aenter__()
 
-        # background listener
+        # Start background listener
         self._listen_task = asyncio.create_task(self._listen_loop())
 
     async def _listen_loop(self):
+        """
+        Listen for Gemini responses, buffer text, and detect turn completion.
+        """
         try:
             async for event in self._session.receive():
                 server_content = getattr(event, "server_content", None)
@@ -71,23 +80,28 @@ class GeminiLiveSession:
                     continue
 
                 for part in model_turn.parts:
-                    if hasattr(part, "text") and part.text:
-                        self._current_text_parts.append(part.text)
+                    text = getattr(part, "text", None)
+                    if text:
+                        self._current_text_parts.append(text)
 
+                # Some SDK builds expose turn_complete; guard with getattr
                 if getattr(server_content, "turn_complete", False):
                     final_text = "".join(self._current_text_parts).strip()
                     self._current_text_parts = []
                     if final_text:
-                        logger.info(f"[#{self.call_sid}] Gemini final: {final_text}")
+                        logger.info(f"[{self.call_sid}] Gemini final: {final_text}")
                         try:
-                            # async callback: let app.py handle TTS+Twilio
                             await self.on_final_text(final_text)
                         except Exception as e:
                             logger.error(f"[{self.call_sid}] on_final_text error: {e}")
         except Exception as e:
-            logger.error(f"[{self.call_sid}] Gemini listen loop error: {e}")
+            if not self._closed:
+                logger.error(f"[{self.call_sid}] Gemini listen loop error: {e}")
 
     async def send_audio_chunk(self, pcm16_bytes: bytes, sample_rate: int = 8000):
+        """
+        Send raw PCM16 mono audio to Gemini Live.
+        """
         if not self._session:
             return
         try:
@@ -100,8 +114,14 @@ class GeminiLiveSession:
             logger.error(f"[{self.call_sid}] Error sending audio to Gemini: {e}")
 
     async def close(self):
+        """
+        Cleanly close the Live session.
+        """
+        self._closed = True
         try:
-            if self._session:
-                await self._session.close()
+            if self._listen_task:
+                self._listen_task.cancel()
+            if self._session_cm:
+                await self._session_cm.__aexit__(None, None, None)
         except Exception as e:
             logger.error(f"[{self.call_sid}] Error closing Gemini session: {e}")
