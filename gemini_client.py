@@ -11,7 +11,8 @@ logger = logging.getLogger("gemini-live")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash-native-audio-preview-09-2025",
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL","gemini-1.5-flash",
+)
 )
 
 if not GEMINI_API_KEY:
