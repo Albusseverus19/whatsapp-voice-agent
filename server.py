@@ -44,7 +44,7 @@ DEFAULT_TTS_MODEL = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_v3")
 # Twilio media format
 TWILIO_AUDIO_MIME = "audio/mulaw;rate=8000"
 
-SEGMENT_MS = 2000           # 2s audio chunks
+SEGMENT_MS = 800             # 0.8s chunks so STT runs quickly
 MAX_SEGMENTS_PER_CALL = 40  # safety limit
 WORKER_IDLE_TIMEOUT = 15    # stop worker if idle
 
