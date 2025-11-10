@@ -148,42 +148,41 @@ class CallContext:
 def safe_stt_georgian(audio_bytes: bytes, stream_sid: str) -> str | None:
     """
     Send one short audio segment to Gemini for transcription.
-    We FORCE it to only transcribe Georgian and return plain text.
+    Return plain text (we'll log and use whatever we get for now).
     """
     try:
         b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
         resp = genai_client.models.generate_content(
             model=GEMINI_STT_MODEL,
-            contents=[{
-                "role": "user",
-                "parts": [
-                    {
-                        "text": (
-                            "გთხოვ ზუსტად და მოკლედ გადააქციე ეს აუდიო ქართულ ტექსტად. "
-                            "არ დაამატო არანაირი ახსნა, თარგმანი ან დამატებითი ტექსტი. "
-                            "მომეცი მხოლოდ ის, რაც დამრეკვლმა თქვა ქართულად."
-                        )
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": TWILIO_AUDIO_MIME,
-                            "data": b64
-                        }
-                    },
-                ],
-            }],
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "გთხოვ ზუსტად გადააქციე ეს აუდიო ქართულ ტექსტად. "
+                                "არ დაამატო არააფერი გარდა დიქტორის ნათქვამის ზუსტი გადმოცემისა. "
+                                "თუ არ გესმის, დაწერე მხოლოდ: 'ვერ გავიგე'."
+                            )
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": TWILIO_AUDIO_MIME,
+                                "data": b64,
+                            }
+                        },
+                    ],
+                }
+            ],
         )
 
         text = (resp.text or "").strip()
         if not text:
+            log.info(f"[Call {stream_sid}] STT: empty result")
             return None
 
-        # Basic garbage filter (e.g., if model hallucinates non-Georgian)
-        if any(ord(c) > 0x04FF for c in text):  # outside Georgian block & basic ASCII
-            log.warning(f"[Call {stream_sid}] STT suspicious (non-ka chars), dropping: {text}")
-            return None
-
+        log.info(f"[Call {stream_sid}] STT raw: {text}")
         return text
 
     except Exception as e:
@@ -358,6 +357,18 @@ def media(ws):
                 log.info(f"[Twilio] Stream started: {stream_sid}")
                 ctx = CallContext(stream_sid, ws)
                 calls[stream_sid] = ctx
+
+                # Send greeting over the stream via ElevenLabs TTS
+                greeting = (
+                    "გამარჯობა, თქვენ დაგიკავშირდათ ვირტუალური ასისტენტი. "
+                    "გთხოვთ მოკლედ მითხრათ, რა საკითხზე გსურთ დახმარება?"
+                )
+                audio_bytes = tts_elevenlabs(greeting)
+                if audio_bytes:
+                    send_audio_to_twilio(ws, audio_bytes, stream_sid)
+                else:
+                    log.error("[Call %s] Failed to generate greeting TTS", stream_sid)
+
 
             elif event == "media" and ctx:
                 media = msg.get("media", {})
