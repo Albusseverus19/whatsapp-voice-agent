@@ -113,7 +113,9 @@ class CallContext:
         try:
             while self.active:
                 try:
+                    log.info(f"[Call {self.stream_sid}] Worker waiting for segment...")
                     segment = self.segment_queue.get(timeout=1)
+                    log.info(f"[Call {self.stream_sid}] Worker got segment: {len(segment) if segment else 0} bytes")
                 except queue.Empty:
                     if (time.time() - self.last_activity) > WORKER_IDLE_TIMEOUT:
                         log.info(f"[Call {self.stream_sid}] Worker idle timeout, stopping")
@@ -127,27 +129,32 @@ class CallContext:
                 self.last_activity = time.time()
 
                 # STT
+                log.info(f"[Call {self.stream_sid}] Starting STT...")
                 text = safe_stt_georgian(segment, self.stream_sid)
+                log.info(f"[Call {self.stream_sid}] STT completed, result: {text}")
                 if not text:
+                    log.info(f"[Call {self.stream_sid}] No text from STT, skipping")
                     continue
 
                 log.info(f"[Call {self.stream_sid}] STT text: {text}")
 
                 # Chat
+                log.info(f"[Call {self.stream_sid}] Starting chat...")
                 reply = generate_reply(text, self.stream_sid)
-                log.info(f"[Call {self.stream_sid}] Reply: {reply}")
+                log.info(f"[Call {self.stream_sid}] Chat completed, reply: {reply}")
 
                 # TTS
+                log.info(f"[Call {self.stream_sid}] Starting TTS...")
                 audio_bytes = tts_elevenlabs(reply, self.stream_sid)
+                log.info(f"[Call {self.stream_sid}] TTS completed, bytes: {len(audio_bytes) if audio_bytes else 0}")
                 if audio_bytes:
                     send_audio_to_twilio(self.ws, audio_bytes, self.stream_sid)
 
         except Exception as e:
-            log.error(f"[Call {self.stream_sid}] Worker fatal error: {e}")
+            log.error(f"[Call {self.stream_sid}] Worker fatal error: {e}", exc_info=True)
         finally:
             self.active = False
             log.info(f"[Call {self.stream_sid}] Worker stopped")
-
     # ---------- Media handling ----------
 
     def add_media(self, chunk_bytes: bytes):
