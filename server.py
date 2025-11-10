@@ -33,9 +33,9 @@ from elevenlabs import VoiceSettings
 
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
 
-# Models
-GEMINI_STT_MODEL = "gemini-2.5-flash"
 GEMINI_STT_MODEL = "gemini-1.5-pro"
+GEMINI_CHAT_MODEL = "gemini-2.5-flash"
+
 
 # ElevenLabs voice config
 DEFAULT_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")  # Jessica
