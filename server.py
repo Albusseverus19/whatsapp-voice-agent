@@ -333,19 +333,26 @@ def voice():
 def media(ws):
     """
     Handles Twilio Media Streams over WebSocket.
+    Twilio sends JSON messages as text frames.
     """
     stream_sid = None
     ctx: CallContext | None = None
 
     try:
-        for raw in ws:
+        while True:
+            raw = ws.receive()
+            if raw is None:
+                # Client (Twilio) closed connection
+                log.info("[WS] Received None (close), breaking loop")
+                break
+
             if not raw:
                 continue
 
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                log.warning(f"[WS] Non-JSON frame: {raw[:60]!r}")
+                log.warning(f"[WS] Non-JSON frame: {repr(raw)[:80]}")
                 continue
 
             event = msg.get("event")
@@ -364,9 +371,8 @@ def media(ws):
                     ctx.add_media(chunk)
 
             elif event == "stop":
-                if ctx:
-                    log.info(f"[Twilio] Stream stopped: {stream_sid}")
-                    break
+                log.info(f"[Twilio] Stream stopped event for {stream_sid}")
+                break
 
     except Exception as e:
         log.error(f"[WS] Error: {e}")
