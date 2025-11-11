@@ -74,7 +74,7 @@ class CallState:
 
     async def handle_audio_from_twilio(self, mulaw_bytes: bytes):
         """
-        Convert Twilio μ-law (8-bit, 8kHz) -> 16-bit PCM and stream to Gemini.
+        Convert Twilio μ-law (8-bit, 8kHz) -> 16-bit PCM 16kHz and stream to Gemini.
         """
         if not self.gemini_session:
             await self.start_gemini()
@@ -82,17 +82,29 @@ class CallState:
         if not mulaw_bytes:
             return
 
-        # Properly decode μ-law to 16-bit linear PCM.
-        # width=2 => output sample width is 16-bit.
         try:
-            pcm16 = audioop.ulaw2lin(mulaw_bytes, 2)
+            # 1) μ-law (8kHz) -> 16-bit linear PCM (8kHz)
+            pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+
+            # 2) Resample 8kHz -> 16kHz for Gemini Live
+            #    (width=2 bytes/sample, nchannels=1)
+            pcm16_16k, _ = audioop.ratecv(
+                pcm16_8k,
+                2,          # sample width (bytes)
+                1,          # channels
+                8000,       # from 8kHz
+                16000,      # to 16kHz
+                None        # state
+            )
+
         except Exception as e:
-            logger.error(f"[{self.call_sid}] Error decoding μ-law from Twilio: {e}")
+            logger.error(f"[{self.call_sid}] Error decoding/resampling μ-law from Twilio: {e}")
             return
 
+        # 3) Send correctly formatted audio to Gemini
         await self.gemini_session.send_audio_chunk(
-            pcm16_bytes=pcm16,
-            sample_rate=8000,  # Twilio stream is 8kHz
+            pcm16_bytes=pcm16_16k,
+            sample_rate=16000,
         )
 
     async def send_twilio_media(self, mulaw_bytes: bytes):
