@@ -69,6 +69,8 @@ class GeminiLiveSession:
         """
         try:
             async for event in self._session.receive():
+                logger.info(f"[{self.call_sid}] Gemini event: {event}")
+
                 server_content = getattr(event, "server_content", None)
                 if not server_content:
                     continue
@@ -82,7 +84,7 @@ class GeminiLiveSession:
                     if text:
                         self._current_text_parts.append(text)
 
-                # Some SDK builds expose turn_complete; guard with getattr
+                # Some builds expose turn_complete flag
                 if getattr(server_content, "turn_complete", False):
                     final_text = "".join(self._current_text_parts).strip()
                     self._current_text_parts = []

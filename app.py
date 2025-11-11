@@ -242,11 +242,15 @@ async def twilio_media(ws: WebSocket):
             elif event == "media":
                 if not call_sid:
                     continue
+
                 payload_b64 = msg["media"]["payload"]
                 mulaw_bytes = base64.b64decode(payload_b64)
 
+                logger.info(f"[{call_sid}] Received media frame: {len(mulaw_bytes)} bytes")
+
                 state = get_call_state(call_sid)
                 await state.handle_audio_from_twilio(mulaw_bytes)
+
 
             elif event == "stop":
                 if call_sid:
