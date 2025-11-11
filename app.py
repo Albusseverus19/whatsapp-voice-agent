@@ -12,12 +12,7 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
 from pydub import AudioSegment
 
-from config import (
-    MEDIA_STREAM_WS_URL,
-    ELEVENLABS_API_KEY,
-    ELEVENLABS_VOICE_ID,
-    ELEVENLABS_MODEL_ID,
-)
+from config import MEDIA_STREAM_WS_URL  # only this comes from config
 from gemini_client import GeminiLiveSession
 
 logging.basicConfig(level=logging.INFO)
@@ -25,10 +20,17 @@ logger = logging.getLogger("twilio-eleven-gemini")
 
 app = FastAPI()
 
+# ----------- Config from env (safe for Render) -----------
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_v3")
+
 # ----------- μ-law encoder -----------
 
 MU_MAX = 32635
 MU_BIAS = 0x84
+
 
 def linear16_sample_to_mulaw(sample: int) -> int:
     """
@@ -65,7 +67,7 @@ def pcm16_to_mulaw(pcm16: bytes) -> bytes:
     for i in range(0, len(pcm16), 2):
         if i + 1 >= len(pcm16):
             break
-        sample = int.from_bytes(pcm16[i:i+2], "little", signed=True)
+        sample = int.from_bytes(pcm16[i:i + 2], "little", signed=True)
         out.append(linear16_sample_to_mulaw(sample))
     return bytes(out)
 
@@ -132,7 +134,7 @@ class CallState:
         chunk_size = 800
 
         for i in range(0, len(mulaw_bytes), chunk_size):
-            chunk = mulaw_bytes[i : i + chunk_size]
+            chunk = mulaw_bytes[i: i + chunk_size]
             if not chunk:
                 continue
 
@@ -171,7 +173,6 @@ class CallState:
         logger.info(f"[{self.call_sid}] Speaking via ElevenLabs: {text}")
 
         try:
-            # Non-streaming TTS, then we stream to Twilio ourselves
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
             headers = {
                 "xi-api-key": ELEVENLABS_API_KEY,
@@ -263,6 +264,7 @@ async def twilio_media(ws: WebSocket):
             if event == "start":
                 call_sid = msg["start"]["callSid"]
                 stream_sid = msg["start"]["streamSid"]
+
                 state = get_call_state(call_sid)
                 state.ws = ws
                 state.stream_sid = stream_sid
