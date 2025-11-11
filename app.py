@@ -4,6 +4,7 @@ import json
 import base64
 import logging
 import asyncio
+import audioop
 from typing import Dict, Optional
 
 import httpx
@@ -32,50 +33,17 @@ INITIAL_GREETING = os.getenv(
     "გამარჯობა, მე ვარ თქვენი ვოის ასისტენტი. გისმენთ."
 )
 
-# ----------- μ-law encoder -----------
-
-MU_MAX = 32635
-MU_BIAS = 0x84
-
-
-def linear16_sample_to_mulaw(sample: int) -> int:
-    """
-    Convert one 16-bit PCM sample to 8-bit μ-law.
-    """
-    sign = 0
-    if sample < 0:
-        sample = -sample
-        sign = 0x80
-
-    if sample > MU_MAX:
-        sample = MU_MAX
-
-    sample += MU_BIAS
-
-    exponent = 7
-    mask = 0x4000
-    for exp in range(7):
-        if sample & mask:
-            exponent = exp
-            break
-        mask >>= 1
-
-    mantissa = (sample >> (exponent + 3)) & 0x0F
-    ulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF
-    return ulaw
-
+# ----------- μ-law encoder (Twilio-compatible) -----------
 
 def pcm16_to_mulaw(pcm16: bytes) -> bytes:
     """
-    Convert linear16 PCM bytes (little-endian) to μ-law bytes.
+    Convert 16-bit linear PCM (little-endian) to 8-bit μ-law.
+    Uses Python's audioop.lin2ulaw, which matches Twilio's μ-law expectations.
     """
-    out = bytearray()
-    for i in range(0, len(pcm16), 2):
-        if i + 1 >= len(pcm16):
-            break
-        sample = int.from_bytes(pcm16[i:i + 2], "little", signed=True)
-        out.append(linear16_sample_to_mulaw(sample))
-    return bytes(out)
+    if not pcm16:
+        return b""
+    # width=2 because samples are 16-bit
+    return audioop.lin2ulaw(pcm16, 2)
 
 
 # ----------- Call state -----------
