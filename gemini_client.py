@@ -70,52 +70,56 @@ class GeminiLiveSession:
 
     async def _listen_loop(self):
         """
-        Listen for Gemini responses, accumulate text, and call on_final_text()
-        when a turn is complete.
-
-        This version is defensive:
-        - Handles event.text (simple text responses)
-        - Handles server_content.model_turn.parts[].text
-        - Uses server_content.turn_complete to know when to finalize
-        - Logs what Gemini heard from your audio (input_transcription) if enabled
+        Listen for Gemini responses, collect text, and call on_final_text()
+        whenever a turn is completed.
         """
         try:
             async for event in self._session.receive():
                 logger.info(f"[{self.call_sid}] Gemini event: {event}")
 
-                # 1) Simple text field (some responses use this)
-                if hasattr(event, "text") and event.text:
-                    self._current_text_parts.append(event.text)
+                # 1) If the SDK surfaces plain text (per docs), treat it as a turn.
+                plain_text = getattr(event, "text", None)
+                if plain_text:
+                    final_text = plain_text.strip()
+                    if final_text:
+                        logger.info(f"[{self.call_sid}] Gemini final (text field): {final_text}")
+                        try:
+                            await self.on_final_text(final_text)
+                        except Exception as e:
+                            logger.error(f"[{self.call_sid}] on_final_text error: {e}")
+                    continue
 
                 server_content = getattr(event, "server_content", None)
-                if server_content:
-                    # 2) Model turn text chunks
-                    model_turn = getattr(server_content, "model_turn", None)
-                    if model_turn and getattr(model_turn, "parts", None):
-                        for part in model_turn.parts:
-                            text = getattr(part, "text", None)
-                            if text:
-                                self._current_text_parts.append(text)
+                if not server_content:
+                    continue
 
-                    # 3) (Optional) log what Gemini thinks you said from audio
-                    input_tx = getattr(server_content, "input_transcription", None)
-                    if input_tx and getattr(input_tx, "text", None):
-                        logger.info(
-                            f"[{self.call_sid}] Gemini input transcription: {input_tx.text}"
-                        )
+                # 2) Log input transcription (what Gemini heard from user) – debug only.
+                input_tr = getattr(server_content, "input_transcription", None)
+                if input_tr and getattr(input_tr, "text", None):
+                    logger.info(f"[{self.call_sid}] Gemini heard (user): {input_tr.text}")
 
-                    # 4) Turn complete → flush accumulated text to TTS
-                    if getattr(server_content, "turn_complete", False):
-                        final_text = "".join(self._current_text_parts).strip()
-                        self._current_text_parts = []
-                        if final_text:
-                            logger.info(f"[{self.call_sid}] Gemini final text: {final_text}")
-                            try:
-                                await self.on_final_text(final_text)
-                            except Exception as e:
-                                logger.error(
-                                    f"[{self.call_sid}] on_final_text error: {e}"
-                                )
+                # 3) Accumulate any model_turn text chunks.
+                model_turn = getattr(server_content, "model_turn", None)
+                if model_turn:
+                    for part in getattr(model_turn, "parts", []):
+                        text = getattr(part, "text", None)
+                        if text:
+                            self._current_text_parts.append(text)
+
+                # 4) Consider both turn_complete and generation_complete as end-of-turn.
+                is_turn_complete = bool(getattr(server_content, "turn_complete", False))
+                is_gen_complete = bool(getattr(server_content, "generation_complete", False))
+
+                if is_turn_complete or is_gen_complete:
+                    final_text = "".join(self._current_text_parts).strip()
+                    self._current_text_parts = []
+
+                    if final_text:
+                        logger.info(f"[{self.call_sid}] Gemini final: {final_text}")
+                        try:
+                            await self.on_final_text(final_text)
+                        except Exception as e:
+                            logger.error(f"[{self.call_sid}] on_final_text error: {e}")
 
         except Exception as e:
             if not self._closed:
