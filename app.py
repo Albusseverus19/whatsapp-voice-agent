@@ -86,7 +86,7 @@ class CallState:
             return
 
         try:
-            import audioop
+            import audioop # type: ignore
         except ImportError:
             logger.error(f"[{self.call_sid}] audioop not available; cannot decode μ-law.")
             return
