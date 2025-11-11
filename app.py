@@ -3,6 +3,8 @@ import io
 import json
 import base64
 import logging
+import asyncio
+
 from typing import Dict, Optional
 
 import httpx
