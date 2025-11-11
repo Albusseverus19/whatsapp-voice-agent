@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import base64
+import json
 from typing import Callable, Awaitable, Optional
 
 from google import genai
@@ -98,30 +100,29 @@ class GeminiLiveSession:
             if not self._closed:
                 logger.error(f"[{self.call_sid}] Gemini listen loop error: {e}")
 
-    async def send_audio_chunk(self, pcm16_bytes: bytes, sample_rate: int = 8000):
+
+
+    async def send_audio_chunk(self, pcm16_bytes: bytes, sample_rate: int = 16000):
         """
-        Send raw PCM16 mono audio to Gemini Live.
+        Stream PCM16 mono audio to Gemini Live using the correct
+        real-time 'input_audio_buffer' events.
         """
         if not self._session:
             return
+
         try:
-            blob = types.Blob(
-                data=pcm16_bytes,
-                mime_type=f"audio/pcm;rate={sample_rate}",
-            )
-            await self._session.send_realtime_input(audio=blob)
+            # 1️⃣ Wrap PCM in base64 (Gemini expects base64 audio in JSON events)
+            message = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm16_bytes).decode("ascii"),
+            }
+            await self._session.send(json.dumps(message))
+
+            # 2️⃣ Commit the buffer periodically (about once per second of audio)
+            # 16000 samples/sec * 2 bytes = 32kB → roughly 1 second
+            if len(pcm16_bytes) >= 32000:
+                await self._session.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                await self._session.send(json.dumps({"type": "response.create"}))
+
         except Exception as e:
             logger.error(f"[{self.call_sid}] Error sending audio to Gemini: {e}")
-
-    async def close(self):
-        """
-        Cleanly close the Live session.
-        """
-        self._closed = True
-        try:
-            if self._listen_task:
-                self._listen_task.cancel()
-            if self._session_cm:
-                await self._session_cm.__aexit__(None, None, None)
-        except Exception as e:
-            logger.error(f"[{self.call_sid}] Error closing Gemini session: {e}")
