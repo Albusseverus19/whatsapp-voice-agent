@@ -51,7 +51,10 @@ class GeminiLiveSession:
                 "You are a helpful real-time voice assistant. "
                 "User primarily speaks Georgian. Respond briefly, clearly, and in Georgian."
             ),
+            # Let Gemini send us transcripts of what it thinks the user said
+            "input_audio_transcription": {},
         }
+
 
         logger.info(f"[{self.call_sid}] Starting Gemini Live session with model={GEMINI_MODEL}")
 
@@ -76,6 +79,14 @@ class GeminiLiveSession:
                 server_content = getattr(event, "server_content", None)
                 if not server_content:
                     continue
+
+                # Log user's speech as understood by Gemini (if provided)
+                input_tx = getattr(server_content, "input_transcription", None)
+                if input_tx:
+                    text = getattr(input_tx, "text", None)
+                    if text:
+                        logger.info(f"[{self.call_sid}] Gemini heard (user): {text}")
+
 
                 # If this event has model_turn text, accumulate it
                 model_turn = getattr(server_content, "model_turn", None)
