@@ -4,7 +4,7 @@ import json
 import base64
 import logging
 import asyncio
-import audioop
+import audioop  # type: ignore
 from typing import Dict, Optional
 
 import httpx
@@ -74,7 +74,7 @@ class CallState:
 
     async def handle_audio_from_twilio(self, mulaw_bytes: bytes):
         """
-        Convert Twilio μ-law (8-bit, 8kHz) -> 16-bit PCM 16kHz and stream to Gemini.
+        Twilio 8kHz μ-law -> 16-bit PCM @16kHz -> Gemini.
         """
         if not self.gemini_session:
             await self.start_gemini()
@@ -83,29 +83,36 @@ class CallState:
             return
 
         try:
-            # 1) μ-law (8kHz) -> 16-bit linear PCM (8kHz)
+            # 1) μ-law (8-bit) -> 16-bit PCM @ 8kHz
             pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)
 
-            # 2) Resample 8kHz -> 16kHz for Gemini Live
-            #    (width=2 bytes/sample, nchannels=1)
+            # 2) 8kHz -> 16kHz (Gemini Live native); mono, 16-bit
             pcm16_16k, _ = audioop.ratecv(
                 pcm16_8k,
-                2,          # sample width (bytes)
-                1,          # channels
-                8000,       # from 8kHz
-                16000,      # to 16kHz
-                None        # state
+                2,      # sample width (bytes)
+                1,      # channels
+                8000,   # in rate
+                16000,  # out rate
+                None,
+            )
+
+            if not pcm16_16k:
+                return
+
+            logger.info(
+                f"[{self.call_sid}] Forwarding {len(mulaw_bytes)} μ-law bytes "
+                f"as {len(pcm16_16k)} PCM16@16k to Gemini"
+            )
+
+            await self.gemini_session.send_audio_chunk(
+                pcm16_bytes=pcm16_16k,
+                sample_rate=16000,
             )
 
         except Exception as e:
-            logger.error(f"[{self.call_sid}] Error decoding/resampling μ-law from Twilio: {e}")
-            return
-
-        # 3) Send correctly formatted audio to Gemini
-        await self.gemini_session.send_audio_chunk(
-            pcm16_bytes=pcm16_16k,
-            sample_rate=16000,
-        )
+            logger.error(
+                f"[{self.call_sid}] Error converting/sending Twilio audio to Gemini: {e}"
+            )
 
     async def send_twilio_media(self, mulaw_bytes: bytes):
         """
