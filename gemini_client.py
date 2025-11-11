@@ -75,16 +75,15 @@ class GeminiLiveSession:
                 if not server_content:
                     continue
 
+                # If this event has model_turn text, accumulate it
                 model_turn = getattr(server_content, "model_turn", None)
-                if not model_turn:
-                    continue
+                if model_turn:
+                    for part in model_turn.parts:
+                        text = getattr(part, "text", None)
+                        if text:
+                            self._current_text_parts.append(text)
 
-                for part in model_turn.parts:
-                    text = getattr(part, "text", None)
-                    if text:
-                        self._current_text_parts.append(text)
-
-                # Some builds expose turn_complete flag
+                # IMPORTANT: handle turn_complete even if there's no model_turn on THIS event
                 if getattr(server_content, "turn_complete", False):
                     final_text = "".join(self._current_text_parts).strip()
                     self._current_text_parts = []
@@ -94,24 +93,10 @@ class GeminiLiveSession:
                             await self.on_final_text(final_text)
                         except Exception as e:
                             logger.error(f"[{self.call_sid}] on_final_text error: {e}")
+
         except Exception as e:
             if not self._closed:
                 logger.error(f"[{self.call_sid}] Gemini listen loop error: {e}")
-
-    async def send_audio_chunk(self, pcm16_bytes: bytes, sample_rate: int = 8000):
-        """
-        Send raw PCM16 mono audio to Gemini Live.
-        """
-        if not self._session:
-            return
-        try:
-            blob = types.Blob(
-                data=pcm16_bytes,
-                mime_type=f"audio/pcm;rate={sample_rate}",
-            )
-            await self._session.send_realtime_input(audio=blob)
-        except Exception as e:
-            logger.error(f"[{self.call_sid}] Error sending audio to Gemini: {e}")
 
     async def close(self):
         """
