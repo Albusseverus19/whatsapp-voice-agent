@@ -85,11 +85,6 @@ class CallState:
         if not mulaw_bytes:
             return
 
-        try:
-            import audioop # type: ignore
-        except ImportError:
-            logger.error(f"[{self.call_sid}] audioop not available; cannot decode μ-law.")
-            return
 
         # 8-bit μ-law -> 16-bit linear PCM, keep 8kHz
         try:
