@@ -12,7 +12,7 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
 from pydub import AudioSegment
 
-from config import MEDIA_STREAM_WS_URL  # only this comes from config
+from config import MEDIA_STREAM_WS_URL
 from gemini_client import GeminiLiveSession
 
 logging.basicConfig(level=logging.INFO)
@@ -20,11 +20,17 @@ logger = logging.getLogger("twilio-eleven-gemini")
 
 app = FastAPI()
 
-# ----------- Config from env (safe for Render) -----------
+# ----------- Config from env -----------
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_v3")
+
+# Automatic greeting text (Georgian)
+INITIAL_GREETING = os.getenv(
+    "INITIAL_GREETING",
+    "გამარჯობა, მე ვარ თქვენი ვოის ასისტენტი. გისმენთ."
+)
 
 # ----------- μ-law encoder -----------
 
@@ -81,6 +87,7 @@ class CallState:
         self.stream_sid: Optional[str] = None        # Twilio Media Stream SID
         self.gemini_session: Optional[GeminiLiveSession] = None
         self.speaking = False                        # prevent overlapping TTS
+        self.greeted = False                         # ensure greeting only once
 
     async def start_gemini(self):
         if self.gemini_session is None:
@@ -121,7 +128,7 @@ class CallState:
 
     async def send_twilio_media(self, mulaw_bytes: bytes):
         """
-        Send μ-law 8kHz audio back to Twilio via the bidirectional media stream.
+        Send μ-law 8kHz audio back to Twilio via the media stream.
         Must include streamSid.
         """
         if not self.ws or not self.stream_sid:
@@ -130,8 +137,8 @@ class CallState:
             )
             return
 
-        # Chunk ~100ms at 8kHz μ-law -> 800 bytes
-        chunk_size = 800
+        # Use 20ms frames: 160 samples @ 8kHz = 160 bytes μ-law
+        chunk_size = 160
 
         for i in range(0, len(mulaw_bytes), chunk_size):
             chunk = mulaw_bytes[i: i + chunk_size]
@@ -148,8 +155,8 @@ class CallState:
             }
 
             await self.ws.send_text(json.dumps(msg))
-            # Pace playback so Twilio plays it smoothly
-            await asyncio.sleep(0.1)
+            # 20ms pacing to match Twilio expectations
+            await asyncio.sleep(0.02)
 
     async def speak_text(self, text: str):
         """
@@ -209,6 +216,16 @@ class CallState:
             logger.error(f"[{self.call_sid}] Error in speak_text/ElevenLabs: {e}")
         finally:
             self.speaking = False
+
+    async def send_initial_greeting(self):
+        """
+        Play an automatic greeting once, via ElevenLabs, at call start.
+        """
+        if self.greeted:
+            return
+        self.greeted = True
+        if INITIAL_GREETING.strip():
+            await self.speak_text(INITIAL_GREETING)
 
     async def close(self):
         if self.gemini_session:
@@ -271,7 +288,9 @@ async def twilio_media(ws: WebSocket):
 
                 logger.info(f"[{call_sid}] Media stream started (streamSid={stream_sid})")
 
+                # Start Gemini and immediately play ElevenLabs greeting
                 await state.start_gemini()
+                await state.send_initial_greeting()
 
             elif event == "media":
                 if not call_sid:
