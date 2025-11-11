@@ -4,7 +4,6 @@ import json
 import base64
 import logging
 import asyncio
-
 from typing import Dict, Optional
 
 import httpx
@@ -13,7 +12,12 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
 from pydub import AudioSegment
 
-from config import MEDIA_STREAM_WS_URL, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
+from config import (
+    MEDIA_STREAM_WS_URL,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
+    ELEVENLABS_MODEL_ID,
+)
 from gemini_client import GeminiLiveSession
 
 logging.basicConfig(level=logging.INFO)
@@ -21,12 +25,10 @@ logger = logging.getLogger("twilio-eleven-gemini")
 
 app = FastAPI()
 
-
-# ----------- μ-law encoder (no audioop, works on 3.13+) -----------
+# ----------- μ-law encoder -----------
 
 MU_MAX = 32635
 MU_BIAS = 0x84
-MU = 255
 
 def linear16_sample_to_mulaw(sample: int) -> int:
     """
@@ -73,16 +75,17 @@ def pcm16_to_mulaw(pcm16: bytes) -> bytes:
 class CallState:
     def __init__(self, call_sid: str):
         self.call_sid = call_sid
-        self.ws: Optional[WebSocket] = None
+        self.ws: Optional[WebSocket] = None          # Twilio WebSocket connection
+        self.stream_sid: Optional[str] = None        # Twilio Media Stream SID
         self.gemini_session: Optional[GeminiLiveSession] = None
-        self.speaking = False  # simple lock to avoid overlap
+        self.speaking = False                        # prevent overlapping TTS
 
     async def start_gemini(self):
         if self.gemini_session is None:
             async def on_final_text(text: str):
                 """
                 Called when Gemini has a complete reply.
-                Here we trigger ElevenLabs TTS and send audio back to Twilio.
+                Trigger ElevenLabs TTS and send audio back to Twilio.
                 """
                 await self.speak_text(text)
 
@@ -106,14 +109,49 @@ class CallState:
             frame_rate=8000,
             channels=1,
         )
-        pcm_audio = audio.set_sample_width(2)
+        pcm_audio = audio.set_sample_width(2)  # 16-bit PCM
         pcm16 = pcm_audio.raw_data
 
-        await self.gemini_session.send_audio_chunk(pcm16_bytes=pcm16, sample_rate=8000)
+        await self.gemini_session.send_audio_chunk(
+            pcm16_bytes=pcm16,
+            sample_rate=8000,
+        )
+
+    async def send_twilio_media(self, mulaw_bytes: bytes):
+        """
+        Send μ-law 8kHz audio back to Twilio via the bidirectional media stream.
+        Must include streamSid.
+        """
+        if not self.ws or not self.stream_sid:
+            logger.warning(
+                f"[{self.call_sid}] Cannot send media: ws={bool(self.ws)}, stream_sid={self.stream_sid}"
+            )
+            return
+
+        # Chunk ~100ms at 8kHz μ-law -> 800 bytes
+        chunk_size = 800
+
+        for i in range(0, len(mulaw_bytes), chunk_size):
+            chunk = mulaw_bytes[i : i + chunk_size]
+            if not chunk:
+                continue
+
+            b64 = base64.b64encode(chunk).decode("utf-8")
+            msg = {
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {
+                    "payload": b64,
+                },
+            }
+
+            await self.ws.send_text(json.dumps(msg))
+            # Pace playback so Twilio plays it smoothly
+            await asyncio.sleep(0.1)
 
     async def speak_text(self, text: str):
         """
-        Use ElevenLabs v3 TTS to synthesize `text` and send it back
+        Use ElevenLabs TTS to synthesize `text` and send it back
         to the caller as μ-law frames over the Twilio WebSocket.
         """
         if not self.ws:
@@ -121,6 +159,9 @@ class CallState:
             return
         if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
             logger.error(f"[{self.call_sid}] ElevenLabs config missing.")
+            return
+        if not self.stream_sid:
+            logger.error(f"[{self.call_sid}] streamSid missing; cannot send audio.")
             return
         if self.speaking:
             logger.info(f"[{self.call_sid}] Already speaking, skipping overlapping TTS.")
@@ -130,6 +171,7 @@ class CallState:
         logger.info(f"[{self.call_sid}] Speaking via ElevenLabs: {text}")
 
         try:
+            # Non-streaming TTS, then we stream to Twilio ourselves
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
             headers = {
                 "xi-api-key": ELEVENLABS_API_KEY,
@@ -159,21 +201,8 @@ class CallState:
             # Convert to μ-law bytes for Twilio Media Streams
             mulaw = pcm16_to_mulaw(pcm16)
 
-            # Send in chunks (~20ms frames) to Twilio
-            frame_samples = 160  # 20ms at 8kHz
-            frame_size = frame_samples  # since μ-law is 1 byte per sample
-
-            for i in range(0, len(mulaw), frame_size):
-                frame = mulaw[i:i+frame_size]
-                if not frame:
-                    continue
-                b64 = base64.b64encode(frame).decode("utf-8")
-                await self.ws.send_text(json.dumps({
-                    "event": "media",
-                    "media": {"payload": b64}
-                }))
-                # small delay to approximate natural playback pacing
-                await asyncio.sleep(0.02)
+            # Send to Twilio with correct format + streamSid
+            await self.send_twilio_media(mulaw)
 
         except Exception as e:
             logger.error(f"[{self.call_sid}] Error in speak_text/ElevenLabs: {e}")
@@ -210,12 +239,10 @@ async def twilio_voice_answer(request: Request):
         url=MEDIA_STREAM_WS_URL
     )
 
-
     twiml_str = str(vr)
     logger.info(f"TwiML response for {call_sid}: {twiml_str}")
 
     return twiml_str
-
 
 
 # ----------- 2. Twilio Media Stream WebSocket -----------
@@ -235,9 +262,12 @@ async def twilio_media(ws: WebSocket):
 
             if event == "start":
                 call_sid = msg["start"]["callSid"]
+                stream_sid = msg["start"]["streamSid"]
                 state = get_call_state(call_sid)
                 state.ws = ws
-                logger.info(f"[{call_sid}] Media stream started")
+                state.stream_sid = stream_sid
+
+                logger.info(f"[{call_sid}] Media stream started (streamSid={stream_sid})")
 
                 await state.start_gemini()
 
@@ -252,7 +282,6 @@ async def twilio_media(ws: WebSocket):
 
                 state = get_call_state(call_sid)
                 await state.handle_audio_from_twilio(mulaw_bytes)
-
 
             elif event == "stop":
                 if call_sid:
@@ -276,6 +305,5 @@ async def twilio_media(ws: WebSocket):
 # ----------- Local run -----------
 
 if __name__ == "__main__":
-    import asyncio
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8001)))
