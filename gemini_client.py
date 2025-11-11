@@ -70,42 +70,52 @@ class GeminiLiveSession:
 
     async def _listen_loop(self):
         """
-        Listen for Gemini responses, buffer text, and detect turn completion.
+        Listen for Gemini responses, accumulate text, and call on_final_text()
+        when a turn is complete.
+
+        This version is defensive:
+        - Handles event.text (simple text responses)
+        - Handles server_content.model_turn.parts[].text
+        - Uses server_content.turn_complete to know when to finalize
+        - Logs what Gemini heard from your audio (input_transcription) if enabled
         """
         try:
             async for event in self._session.receive():
                 logger.info(f"[{self.call_sid}] Gemini event: {event}")
 
+                # 1) Simple text field (some responses use this)
+                if hasattr(event, "text") and event.text:
+                    self._current_text_parts.append(event.text)
+
                 server_content = getattr(event, "server_content", None)
-                if not server_content:
-                    continue
+                if server_content:
+                    # 2) Model turn text chunks
+                    model_turn = getattr(server_content, "model_turn", None)
+                    if model_turn and getattr(model_turn, "parts", None):
+                        for part in model_turn.parts:
+                            text = getattr(part, "text", None)
+                            if text:
+                                self._current_text_parts.append(text)
 
-                # Log user's speech as understood by Gemini (if provided)
-                input_tx = getattr(server_content, "input_transcription", None)
-                if input_tx:
-                    text = getattr(input_tx, "text", None)
-                    if text:
-                        logger.info(f"[{self.call_sid}] Gemini heard (user): {text}")
+                    # 3) (Optional) log what Gemini thinks you said from audio
+                    input_tx = getattr(server_content, "input_transcription", None)
+                    if input_tx and getattr(input_tx, "text", None):
+                        logger.info(
+                            f"[{self.call_sid}] Gemini input transcription: {input_tx.text}"
+                        )
 
-
-                # If this event has model_turn text, accumulate it
-                model_turn = getattr(server_content, "model_turn", None)
-                if model_turn:
-                    for part in model_turn.parts:
-                        text = getattr(part, "text", None)
-                        if text:
-                            self._current_text_parts.append(text)
-
-                # IMPORTANT: handle turn_complete even if there's no model_turn on THIS event
-                if getattr(server_content, "turn_complete", False):
-                    final_text = "".join(self._current_text_parts).strip()
-                    self._current_text_parts = []
-                    if final_text:
-                        logger.info(f"[{self.call_sid}] Gemini final: {final_text}")
-                        try:
-                            await self.on_final_text(final_text)
-                        except Exception as e:
-                            logger.error(f"[{self.call_sid}] on_final_text error: {e}")
+                    # 4) Turn complete → flush accumulated text to TTS
+                    if getattr(server_content, "turn_complete", False):
+                        final_text = "".join(self._current_text_parts).strip()
+                        self._current_text_parts = []
+                        if final_text:
+                            logger.info(f"[{self.call_sid}] Gemini final text: {final_text}")
+                            try:
+                                await self.on_final_text(final_text)
+                            except Exception as e:
+                                logger.error(
+                                    f"[{self.call_sid}] on_final_text error: {e}"
+                                )
 
         except Exception as e:
             if not self._closed:
