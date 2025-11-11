@@ -128,8 +128,8 @@ class CallState:
 
     async def send_twilio_media(self, mulaw_bytes: bytes):
         """
-        Send μ-law 8kHz audio back to Twilio via the media stream.
-        Must include streamSid.
+        Send μ-law 8kHz audio back to Twilio via the media stream
+        in strict 20 ms (160-byte) frames, padding the last frame if needed.
         """
         if not self.ws or not self.stream_sid:
             logger.warning(
@@ -137,26 +137,37 @@ class CallState:
             )
             return
 
-        # Use 20ms frames: 160 samples @ 8kHz = 160 bytes μ-law
-        chunk_size = 160
+        FRAME_SIZE = 160            # 20ms @ 8000 Hz μ-law
+        FRAME_DURATION = 0.02       # 20ms in seconds
 
-        for i in range(0, len(mulaw_bytes), chunk_size):
-            chunk = mulaw_bytes[i: i + chunk_size]
-            if not chunk:
-                continue
+        total = len(mulaw_bytes)
+        if total == 0:
+            return
 
-            b64 = base64.b64encode(chunk).decode("utf-8")
-            msg = {
+        logger.info(f"[{self.call_sid}] Sending {total} bytes of μ-law audio to Twilio")
+
+        offset = 0
+        while offset < total:
+            chunk = mulaw_bytes[offset:offset + FRAME_SIZE]
+            offset += FRAME_SIZE
+
+            # Pad last frame if it's shorter than 160 bytes
+            if len(chunk) < FRAME_SIZE:
+                padding = FRAME_SIZE - len(chunk)
+                chunk += b'\xFF' * padding  # μ-law silence
+
+            payload = base64.b64encode(chunk).decode("ascii")
+
+            message = {
                 "event": "media",
                 "streamSid": self.stream_sid,
                 "media": {
-                    "payload": b64,
+                    "payload": payload,
                 },
             }
 
-            await self.ws.send_text(json.dumps(msg))
-            # 20ms pacing to match Twilio expectations
-            await asyncio.sleep(0.02)
+            await self.ws.send_text(json.dumps(message))
+            await asyncio.sleep(FRAME_DURATION)
 
     async def speak_text(self, text: str):
         """
