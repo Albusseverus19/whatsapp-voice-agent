@@ -9,11 +9,8 @@ from google.genai import types
 logger = logging.getLogger("gemini-live")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL","gemini-1.5-flash",
-)
-)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
 
 if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY is not set. Gemini Live will not work until configured.")
