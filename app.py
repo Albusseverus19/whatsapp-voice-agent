@@ -74,45 +74,35 @@ class CallState:
 
     async def handle_audio_from_twilio(self, mulaw_bytes: bytes):
         """
-        Twilio 8kHz μ-law -> 16-bit PCM @16kHz -> Gemini.
+        Convert Twilio μ-law (8-bit, 8kHz) -> 16-bit PCM (8kHz) and stream to Gemini.
+        Uses stdlib audioop.ulaw2lin for correct decoding.
         """
         if not self.gemini_session:
             await self.start_gemini()
+            if not self.gemini_session:
+                return
 
         if not mulaw_bytes:
             return
 
         try:
-            # 1) μ-law (8-bit) -> 16-bit PCM @ 8kHz
-            pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+            import audioop
+        except ImportError:
+            logger.error(f"[{self.call_sid}] audioop not available; cannot decode μ-law.")
+            return
 
-            # 2) 8kHz -> 16kHz (Gemini Live native); mono, 16-bit
-            pcm16_16k, _ = audioop.ratecv(
-                pcm16_8k,
-                2,      # sample width (bytes)
-                1,      # channels
-                8000,   # in rate
-                16000,  # out rate
-                None,
-            )
-
-            if not pcm16_16k:
-                return
-
-            logger.info(
-                f"[{self.call_sid}] Forwarding {len(mulaw_bytes)} μ-law bytes "
-                f"as {len(pcm16_16k)} PCM16@16k to Gemini"
-            )
-
-            await self.gemini_session.send_audio_chunk(
-                pcm16_bytes=pcm16_16k,
-                sample_rate=16000,
-            )
-
+        # 8-bit μ-law -> 16-bit linear PCM, keep 8kHz
+        try:
+            pcm16 = audioop.ulaw2lin(mulaw_bytes, 2)  # width=2 -> 16-bit samples
         except Exception as e:
-            logger.error(
-                f"[{self.call_sid}] Error converting/sending Twilio audio to Gemini: {e}"
-            )
+            logger.error(f"[{self.call_sid}] ulaw2lin failed: {e}")
+            return
+
+        # Send to Gemini Live (it accepts arbitrary PCM16 sample_rate, will resample)
+        await self.gemini_session.send_audio_chunk(
+            pcm16_bytes=pcm16,
+            sample_rate=8000,
+        )
 
     async def send_twilio_media(self, mulaw_bytes: bytes):
         """
