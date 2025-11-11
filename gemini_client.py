@@ -98,6 +98,21 @@ class GeminiLiveSession:
             if not self._closed:
                 logger.error(f"[{self.call_sid}] Gemini listen loop error: {e}")
 
+    async def send_audio_chunk(self, pcm16_bytes: bytes, sample_rate: int = 8000):
+        """
+        Send raw PCM16 mono audio to Gemini Live.
+        """
+        if not self._session:
+            return
+        try:
+            blob = types.Blob(
+                data=pcm16_bytes,
+                mime_type=f"audio/pcm;rate={sample_rate}",
+            )
+            await self._session.send_realtime_input(audio=blob)
+        except Exception as e:
+            logger.error(f"[{self.call_sid}] Error sending audio to Gemini: {e}")
+
     async def close(self):
         """
         Cleanly close the Live session.
